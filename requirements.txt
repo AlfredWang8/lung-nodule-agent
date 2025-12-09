@@ -1,0 +1,12 @@
+langchain
+langchain-openai
+langgraph
+neo4j
+pymupdf
+requests
+python-dotenv
+numpy
+scikit-image
+torch
+torchvision
+openai

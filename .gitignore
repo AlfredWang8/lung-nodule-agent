@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.env
+.venv
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Environment Variables
+.env
+
+# IDEs
+.vscode/
+.idea/
+
+# Large Model Files
+*.pth
+*.onnx
+medsam_tools/MedSAM/medsam_vit_b.pth
+
+# Data and Outputs
+guidelines/*.pdf
+data/
+outputs_nii/
+outputs_png/
+outputs_triples/
+
+# Patient Data (Keep directories but ignore content)
+patient/pic/*
+!patient/pic/.gitkeep
+patient/report/*
+!patient/report/.gitkeep
+patient/info/*.csv
+!patient/info/.gitkeep
+
+# Temporary Test Files
+test_nodule.png
+*_seg.png
+*_seg.nii.gz
+*_overlay.png
