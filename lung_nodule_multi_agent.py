@@ -195,12 +195,11 @@ class MedicalAgentSystem:
         guideline_text = str(guidelines) if guidelines else "未找到具体指南，按常规流程处理。"
 
         prompt = f"""
-        你是一名呼吸科医生。
-        患者信息：{name}, {gender}, {age}岁。
-        患者描述：{full_symptoms}。
-        参考指南信息：{guideline_text}
-        请生成一份初筛报告，并强烈建议进行影像学检查。
-        直接输出报告内容，不要包含"好的"、"以下是报告"等提示语。
+        你是呼吸科医生。请输出初筛结论，要求：
+        - 第一行：一句话总结当前判断与建议（是否需影像学检查与紧急程度）
+        - 后续5-8条要点：症状关键点、危险因素（吸烟/家族史）、初步风险分层、体检与实验室建议、影像学检查类型与时机、随访建议
+        背景：患者信息 {name}, {gender}, {age}岁；症状 {full_symptoms}；指南参考 {guideline_text}
+        直接输出内容，不要包含额外提示语。
         """
         response = self.llm.invoke([HumanMessage(content=prompt)])
         return {
@@ -236,38 +235,51 @@ class MedicalAgentSystem:
         
         # 调用 MedSAM 工具进行分割
         seg_path = None
-        if state.get("nodule_bbox"):
-            print("  -> 执行 AI 辅助分割...")
+        print("  -> 执行 AI 辅助分割...")
+        bbox_used = state.get("nodule_bbox")
+        if not bbox_used:
+            bbox_used = self._suggest_bbox_with_llm(ct_path_input, state.get("symptoms", ""))
+            if bbox_used:
+                print(f"  -> 使用 DeepSeek 建议的目标框: {bbox_used}")
+            else:
+                print("  -> 无有效建议，使用自动目标框")
+        res = self.medsam_tool.detect_and_segment(
+            state['ct_image_path'], 
+            bbox_used, 
+            state.get('slice_z')
+        )
+        if not res['success'] and bbox_used is not None:
+            print("  -> 建议目标框分割失败，回退为自动目标框")
             res = self.medsam_tool.detect_and_segment(
-                state['ct_image_path'], 
-                state['nodule_bbox'], 
+                state['ct_image_path'],
+                None,
                 state.get('slice_z')
             )
-            if res['success']:
-                # 保存到 patient/pic/{id}_seg.png
-                original_out = res['out_path']
-                ext = os.path.splitext(original_out)[1]
+        if res['success']:
+            original_out = res['out_path']
+            ext = os.path.splitext(original_out)[1].lower()
+            if ext == ".gz" and original_out.endswith(".nii.gz"):
+                new_filename = f"{state['patient_id']}_seg.nii.gz"
+            else:
                 new_filename = f"{state['patient_id']}_seg{ext}"
-                target_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "patient", "pic")
-                os.makedirs(target_dir, exist_ok=True)
-                new_path = os.path.join(target_dir, new_filename)
-                
-                import shutil
-                try:
-                    shutil.move(original_out, new_path)
-                    seg_path = new_path
-                    print(f"  -> 分割结果已归档至: {seg_path}")
-                except Exception as e:
-                    print(f"  -> 归档失败: {e}, 保留原路径")
-                    seg_path = original_out
+            target_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "patient", "pic")
+            os.makedirs(target_dir, exist_ok=True)
+            new_path = os.path.join(target_dir, new_filename)
+            import shutil
+            try:
+                shutil.move(original_out, new_path)
+                seg_path = new_path
+                print(f"  -> 分割结果已归档至: {seg_path}")
+            except Exception as e:
+                print(f"  -> 归档失败: {e}, 保留原路径")
+                seg_path = original_out
         
         prompt = f"""
-        你是一名放射科医生。已对患者胸部CT进行检查。
-        检查日期：{ct_date_input}
-        AI 分割结果：{'成功，路径: ' + str(seg_path) if seg_path else '未执行或失败'}。
-        患者临床信息：{state['symptoms']}
-        请生成一份影像学诊断报告，详细描述结节特征（大小、位置、密度、边缘特征如毛刺/分叶）。
-        直接输出报告内容，不要包含"好的"、"以下是报告"等提示语。
+        你是放射科医生。请输出详细影像学诊断：
+        - 第一行：一句话总结（总体结论：结节数量、最大结节位置与性质倾向）
+        - 要点需覆盖：结节数量；逐个结节的大小（长径×短径，单位mm）；形状（圆形/卵圆/不规则）；边缘（毛刺/分叶/光滑）；密度/衰减（纯磨玻璃/部分实性/实性）；钙化与空洞情况；分布（肺叶/段、是否外周/中央）；与胸膜/血管/支气管关系；测量方法与层面索引；AI分割结果与路径；进一步检查与随访建议
+        背景：检查日期 {ct_date_input}；症状 {state['symptoms']}；AI分割：{'成功: ' + str(seg_path) if seg_path else '未执行/失败'}
+        直接输出内容。
         """
         response = self.llm.invoke([HumanMessage(content=prompt)])
         
@@ -280,17 +292,52 @@ class MedicalAgentSystem:
             "current_step": "surgery"
         }
 
+    def _suggest_bbox_with_llm(self, img_path: str, context_text: str = "") -> Optional[List[int]]:
+        try:
+            from skimage import io
+            img = io.imread(img_path)
+            if img.ndim == 2:
+                h, w = img.shape
+            else:
+                h, w = img.shape[0], img.shape[1]
+            prompt = f"""
+            你是放射科分割助手。根据以下临床上下文，选择结节大概率所在区域：
+            {context_text}
+            仅从以下选项中选择并输出一个词：center, right_upper, right_lower, left_upper, left_lower, perihilar
+            只输出该词，不要输出其他内容。
+            """
+            resp = self.llm.invoke([HumanMessage(content=prompt)])
+            region = resp.content.strip().lower()
+            if region == "center" or region == "perihilar":
+                x1 = int(0.25 * w); y1 = int(0.25 * h); x2 = int(0.75 * w); y2 = int(0.75 * h)
+            elif region == "right_upper":
+                x1 = int(0.55 * w); y1 = int(0.05 * h); x2 = int(0.90 * w); y2 = int(0.45 * h)
+            elif region == "right_lower":
+                x1 = int(0.55 * w); y1 = int(0.55 * h); x2 = int(0.90 * w); y2 = int(0.95 * h)
+            elif region == "left_upper":
+                x1 = int(0.10 * w); y1 = int(0.05 * h); x2 = int(0.45 * w); y2 = int(0.45 * h)
+            elif region == "left_lower":
+                x1 = int(0.10 * w); y1 = int(0.55 * h); x2 = int(0.45 * w); y2 = int(0.95 * h)
+            else:
+                return None
+            x1 = max(0, min(w - 2, x1))
+            y1 = max(0, min(h - 2, y1))
+            x2 = max(x1 + 1, min(w - 1, x2))
+            y2 = max(y1 + 1, min(h - 1, y2))
+            return [x1, y1, x2, y2]
+        except Exception:
+            return None
+
     def role_thoracic_surgeon(self, state: MedicalRecord) -> Dict:
         """胸外科医生：临床决策"""
         print(f"\n[胸外科] 正在评估手术指征...")
         
         prompt = f"""
-        你是一名胸外科医生。
-        呼吸科报告：{state['respiratory_report']}
-        放射科报告：{state['radiology_report']}
-        
-        请根据以上信息，判断是否需要进行病理活检或手术（如胸腔镜微创手术），并制定初步手术方案。
-        直接输出方案内容，不要包含"好的"、"以下是方案"等提示语。
+        你是胸外科医生。请输出处置决策：
+        - 第一行：一句话总结（是否手术/活检及主要依据与时机）
+        - 后续6-8条要点：手术适应证与禁忌证；术式选择（楔形/肺段/肺叶切除，开胸/胸腔镜/机器人）；淋巴结处理策略；围手术期评估（心肺功能/麻醉风险）；术前准备与影像再次评估；风险与并发症防范；若不手术的替代方案（活检/随访/消融）；多学科协作计划
+        背景：呼吸科报告：{state['respiratory_report']}；放射科报告：{state['radiology_report']}
+        直接输出内容。
         """
         response = self.llm.invoke([HumanMessage(content=prompt)])
         
@@ -304,14 +351,25 @@ class MedicalAgentSystem:
         """病理科医生：确诊 (交互式录入)"""
         print(f"\n[病理科] 正在进行病理分析...")
         
-        print("病理科医生: 请输入病理活检或术后病理的关键结果（如：浸润性腺癌，高分化，T1N0M0）：")
-        pathology_input = input("助手 (请输入): ")
-        if not pathology_input:
-            pathology_input = "未提供详细病理结果，需结合影像学推断。"
-            
-        state['pathology_result'] = pathology_input
+        # --- KG 检索辅助 ---
+        # 尝试检索与肺部疾病相关的知识作为辅助
+        print(f"  -> [系统] 正在调用知识图谱辅助诊断...")
+        kg_query = "MATCH (n:Disease) WHERE n.name CONTAINS '肺' OR n.name CONTAINS '癌' RETURN n.name, n.description, n.treatment LIMIT 3"
+        kg_data = self.kg_tool.query(kg_query)
+        kg_context = str(kg_data) if kg_data else "暂无直接相关的知识库条目。"
         
-        # 更新 CSV 表格，补充 CT 日期和病理结果
+        prompt = f"""
+        你是病理科医生。请输出确诊意见：
+        - 第一行：一句话核心结论（例如：结论：浸润性腺癌，T1N0M0，风险分层）
+        - 后续6-8条要点：形态学依据（结构/核异型/腺体形成/黏液）；分化程度；必要的免疫组化标志物及解释（如TTF-1、Napsin A、p40等）；分期建议与取材部位说明；切缘与侵袭特征（胸膜/血管/神经）；与影像的整合判断与鉴别诊断；进一步检查或分子检测建议；随访与转诊建议
+        背景：影像学：{state['radiology_report']}；症状：{state['symptoms']}；知识图谱：{kg_context}
+        直接输出内容。
+        """
+        response = self.llm.invoke([HumanMessage(content=prompt)])
+        
+        pathology_conclusion = self._extract_pathology_conclusion(response.content)
+        state['pathology_result'] = pathology_conclusion
+        
         save_patient_info({
             "patient_id": state['patient_id'],
             "name": state['name'],
@@ -319,23 +377,11 @@ class MedicalAgentSystem:
             "gender": state['gender'],
             "symptoms": state['symptoms'],
             "ct_date": state.get('ct_date', ''),
-            "pathology_result": pathology_input
+            "pathology_result": pathology_conclusion
         })
         
-        prompt = f"""
-        你是一名病理科医生。
-        实际病理结果输入：{pathology_input}
-        结合放射科影像特征：{state['radiology_report']}
-        和临床症状：{state['symptoms']}
-        
-        请生成一份**正式的病理确诊报告**。
-        基于输入的病理结果进行专业扩充和解释。
-        直接输出报告内容，不要包含"好的"、"以下是报告"等提示语。
-        """
-        response = self.llm.invoke([HumanMessage(content=prompt)])
-        
         return {
-            "pathology_result": pathology_input,
+            "pathology_result": pathology_conclusion,
             "pathology_report": response.content,
             "history": state["history"] + ["病理科已出具报告"],
             "current_step": "oncology"
@@ -346,12 +392,11 @@ class MedicalAgentSystem:
         print(f"\n[放射肿瘤科] 正在制定放疗计划...")
         
         prompt = f"""
-        你是一名放射肿瘤科医生。
-        病理报告：{state['pathology_report']}
-        手术方案：{state['surgical_plan']}
-        
-        请制定后续治疗规划（如放疗、化疗或靶向治疗建议）。
-        直接输出规划内容，不要包含"好的"、"以下是规划"等提示语。
+        你是放射肿瘤科医生。请输出极简治疗规划：
+        - 第一行：一句话总结（首选治疗方案与目标）
+        - 后续3-5条要点（剂量/疗程、联合治疗、随访计划、注意事项）
+        背景：病理：{state['pathology_report']}；外科：{state['surgical_plan']}
+        直接输出内容。
         """
         response = self.llm.invoke([HumanMessage(content=prompt)])
         
@@ -366,9 +411,10 @@ class MedicalAgentSystem:
         print(f"\n[康复科] 正在制定康复方案...")
         
         prompt = f"""
-        你是一名康复科医生。患者经历了肺癌诊疗流程。
-        请制定一份术后/治疗后呼吸功能康复计划。
-        直接输出计划内容，不要包含"好的"、"以下是计划"等提示语。
+        你是康复科医生。请输出极简康复指导：
+        - 第一行：一句话总结（康复重点与总体目标）
+        - 后续3-5条要点（呼吸训练、运动方案、随访与预警、生活方式）
+        直接输出内容。
         """
         response = self.llm.invoke([HumanMessage(content=prompt)])
         
@@ -377,6 +423,22 @@ class MedicalAgentSystem:
             "history": state["history"] + ["康复科已制定计划"],
             "current_step": "finished"
         }
+    
+    def _extract_pathology_conclusion(self, report_text: str) -> str:
+        try:
+            lines = [l.strip() for l in report_text.splitlines() if l.strip()]
+            if not lines:
+                return "自动推断病理结论"
+            first = lines[0]
+            if "：" in first:
+                parts = first.split("：", 1)
+                return parts[1].strip() or first.strip()
+            if ":" in first:
+                parts = first.split(":", 1)
+                return parts[1].strip() or first.strip()
+            return first[:100]
+        except Exception:
+            return "自动推断病理结论"
 
     def run(self, inputs: MedicalRecord):
         return self.workflow.invoke(inputs)
@@ -418,33 +480,43 @@ if __name__ == "__main__":
     # 将最终报告写入文件
     report_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "patient", "report")
     os.makedirs(report_dir, exist_ok=True)
-    report_file = os.path.join(report_dir, f"{final_state['patient_id']}_report.txt")
+    report_file = os.path.join(report_dir, f"{final_state['patient_id']}_report.md")
     
     with open(report_file, "w", encoding="utf-8") as f:
-        f.write("=== 肺结节多学科会诊(MDT)综合报告 ===\n\n")
-        f.write(f"患者ID: {final_state['patient_id']}\n")
-        f.write(f"姓名: {final_state.get('name', '未记录')}\n")
-        f.write(f"性别: {final_state.get('gender', '未记录')}  年龄: {final_state.get('age', '未记录')}\n")
-        f.write(f"主诉症状: {final_state['symptoms']}\n")
-        f.write("-" * 50 + "\n\n")
+        f.write(f"# 肺结节多学科会诊(MDT)综合报告\n\n")
+        f.write(f"- 患者ID: {final_state['patient_id']}\n")
+        f.write(f"- 姓名: {final_state.get('name', '未记录')}\n")
+        f.write(f"- 性别: {final_state.get('gender', '未记录')}\n")
+        f.write(f"- 年龄: {final_state.get('age', '未记录')}\n")
+        f.write(f"- 主诉症状: {final_state['symptoms']}\n\n")
         
-        f.write("【1. 呼吸科初筛报告】\n")
+        seg_path_md = final_state.get('segmentation_path', None)
+        if seg_path_md:
+            ext = os.path.splitext(seg_path_md)[1].lower()
+            if ext in ['.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff']:
+                rel_seg = os.path.relpath(seg_path_md, os.path.dirname(report_file))
+                f.write(f"![AI分割结果]({rel_seg})\n\n")
+            else:
+                f.write(f"> AI 分割结果路径: {seg_path_md}\n\n")
+        else:
+            f.write(f"> AI 分割结果：未生成\n\n")
+        
+        f.write(f"## 1. 呼吸科初筛报告\n\n")
         f.write(final_state['respiratory_report'] + "\n\n")
         
-        f.write("【2. 放射科影像报告】\n")
-        f.write(final_state['radiology_report'] + "\n")
-        f.write(f"AI 分割图像路径: {final_state.get('segmentation_path', '未生成')}\n\n")
+        f.write(f"## 2. 放射科影像报告\n\n")
+        f.write(final_state['radiology_report'] + "\n\n")
         
-        f.write("【3. 胸外科手术/治疗建议】\n")
+        f.write(f"## 3. 胸外科手术/治疗建议\n\n")
         f.write(final_state['surgical_plan'] + "\n\n")
         
-        f.write("【4. 病理科确诊报告】\n")
+        f.write(f"## 4. 病理科确诊报告\n\n")
         f.write(final_state['pathology_report'] + "\n\n")
         
-        f.write("【5. 肿瘤科治疗规划】\n")
+        f.write(f"## 5. 肿瘤科治疗规划\n\n")
         f.write(final_state['oncology_plan'] + "\n\n")
         
-        f.write("【6. 康复科康复指导】\n")
+        f.write(f"## 6. 康复科康复指导\n\n")
         f.write(final_state['rehab_plan'] + "\n")
     
     print(f"\n✅ 完整诊疗报告已生成: {os.path.abspath(report_file)}")
@@ -459,11 +531,19 @@ if __name__ == "__main__":
     print(f"7. 康复计划: {final_state['rehab_plan'][:50]}...")
     
     # 清理测试文件
-    if "test_nodule" in test_img:
-        try:
-            os.remove(test_img)
-            seg = final_state.get("segmentation_path")
-            if seg and os.path.exists(seg):
-                os.remove(seg)
-        except:
-            pass
+    # if "test_nodule" in test_img:
+    #     try:
+    #         os.remove(test_img)
+    #         seg = final_state.get("segmentation_path")
+    #         if seg and os.path.exists(seg):
+    #             base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "patient", "pic")
+    #             seg_abs = os.path.abspath(seg)
+    #             base_abs = os.path.abspath(base_dir)
+    #             try:
+    #                 common = os.path.commonpath([seg_abs, base_abs])
+    #             except ValueError:
+    #                 common = ""
+    #             if common != base_abs:
+    #                 os.remove(seg)
+    #     except:
+    #         pass
