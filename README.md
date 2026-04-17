@@ -56,7 +56,7 @@ d:\Code\agent\
     ```
 
 4.  **准备模型文件**
-    确保 `lung-nodule-agent/nnUNet_backup/nnUNetFrame/DATASET/nnUNet_trained_models/nnUNet/3d_fullres/Task500_LungNodule/nnUNetTrainerV2__nnUNetPlansv2.1` 模型权重文件存在。如果不存在，
+    确保 `lung-nodule-agent/nnUNet_backup/nnUNetFrame/DATASET/nnUNet_trained_models/nnUNet/3d_fullres/Task500_LungNodule/nnUNetTrainerV2__nnUNetPlansv2.1` 模型权重文件存在。如果不存在，请前往 https://drive.google.com/file/d/1nz6oVaPhkzpEkLaVTJAuuyt0QL2ROfFX/view?usp=sharing 进行下载。
 
 ## 运行系统
 
